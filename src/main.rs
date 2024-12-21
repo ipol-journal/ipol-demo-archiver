@@ -1,12 +1,12 @@
 use anyhow::{Context, Result};
 use bollard::Docker;
 use clap::Parser;
+use futures_util::stream::StreamExt;
 use opendal::services;
 use opendal::Operator;
 use tracing::{error, info};
 
 #[derive(Parser)]
-#[command(author, version, about, long_about = None)]
 struct Cli {
     /// Filter images by prefix
     #[arg(long)]
@@ -17,8 +17,20 @@ struct Cli {
     bucket: String,
 
     /// S3 region
-    #[arg(long, env = "S3_REGION", default_value = "us-east-1")]
+    #[arg(long, env = "S3_REGION")]
     region: String,
+
+    /// S3 endpoint
+    #[arg(long, env = "S3_ENDPOINT")]
+    endpoint: String,
+
+    /// S3 access key id
+    #[arg(long, env = "S3_ACCESS_KEY_ID")]
+    access_key_id: String,
+
+    /// S3 secret access key
+    #[arg(long, env = "S3_SECRET_ACCESS_KEY")]
+    secret_access_key: String,
 }
 
 struct ImageArchiver {
@@ -32,8 +44,6 @@ impl ImageArchiver {
     }
 
     async fn upload_image(&self, image: bollard::models::ImageSummary) -> Result<()> {
-        use futures_util::stream::StreamExt;
-
         let image_tag = image
             .repo_tags
             .first()
@@ -64,17 +74,17 @@ impl ImageArchiver {
             .context("Failed to create writer")?;
 
         info!("Uploading image {} to {}", image_tag, path);
-        let pb = indicatif::ProgressBar::new_spinner();
-        pb.set_style(indicatif::ProgressStyle::default_spinner().template(
-            "{spinner:.green} [{elapsed_precise}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})",
-        )?);
+        let pb = indicatif::ProgressBar::new_spinner().with_style(
+            indicatif::ProgressStyle::with_template(
+                "{spinner:.green} [{elapsed_precise}] {bytes} ({bytes_per_sec})",
+            )?,
+        );
 
         let result = {
             while let Some(chunk) = tar_stream.next().await {
                 match chunk {
                     Ok(bytes) => {
                         let len = bytes.len();
-                        dbg!(len);
                         writer.write(bytes).await.context("Failed to write chunk")?;
                         pb.inc(len as u64);
                     }
@@ -104,34 +114,25 @@ impl ImageArchiver {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Initialize logging
     tracing_subscriber::fmt::init();
 
     let cli = Cli::parse();
 
-    // Initialize Docker client
     let docker = Docker::connect_with_local_defaults().context("Failed to connect to Docker")?;
 
-    // Initialize S3 storage
     let builder = services::S3::default()
         .bucket(&cli.bucket)
-        .region(&cli.region);
-
-    let builder = builder
-        .root("/")
-        .endpoint("http://172.17.0.1:9000")
-        .bucket(&cli.bucket)
-        .access_key_id("minioadmin")
-        .secret_access_key("minioadmin")
         .region(&cli.region)
+        .root("/")
         .disable_ec2_metadata()
-        .disable_stat_with_override();
+        .endpoint(&cli.endpoint)
+        .access_key_id(&cli.access_key_id)
+        .secret_access_key(&cli.secret_access_key);
 
     let storage = Operator::new(builder)?.finish();
 
     let archiver = ImageArchiver::new(docker.clone(), storage);
 
-    // List and filter images
     let images = docker
         .list_images::<String>(None)
         .await
@@ -148,7 +149,6 @@ async fn main() -> Result<()> {
             })
         });
 
-    // Upload images
     for image in filtered_images {
         if let Err(e) = archiver.upload_image(image).await {
             error!("Failed to upload image: {:#}", e);
