@@ -14,6 +14,14 @@ struct Cli {
     #[arg(long)]
     prefix: Option<String>,
 
+    /// Ignore workshop demos
+    #[arg(long)]
+    ignore_workshop_demos: bool,
+
+    /// Ignore test demos
+    #[arg(long)]
+    ignore_test_demos: bool,
+
     /// S3 bucket name
     #[arg(long, env = "S3_BUCKET")]
     bucket: String,
@@ -151,6 +159,22 @@ async fn main() -> Result<()> {
             cli.prefix.as_ref().map_or(true, |prefix| {
                 image.repo_tags.iter().any(|tag| tag.starts_with(prefix))
             })
+        })
+        .filter(|image| {
+            if cli.ignore_workshop_demos {
+                if let Some(tag) = image.repo_tags.first() {
+                    return !tag.starts_with("ipol-demo-77777");
+                }
+            }
+            true
+        })
+        .filter(|image| {
+            if cli.ignore_test_demos {
+                if let Some(tag) = image.repo_tags.first() {
+                    return !tag.starts_with("ipol-demo-55555");
+                }
+            }
+            true
         });
 
     for image in filtered_images {
