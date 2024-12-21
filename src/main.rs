@@ -79,7 +79,9 @@ impl ImageArchiver {
         let mut tar_stream = self.docker.export_image(&image_tag);
         let mut writer = self
             .storage
-            .writer(&path)
+            .writer_with(&path)
+            .chunk(128 * 1024 * 1024)
+            .concurrent(8)
             .await
             .context("Failed to create writer")?;
 
