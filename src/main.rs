@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use anyhow::{Context, Result};
 use bollard::Docker;
 use clap::Parser;
@@ -118,7 +120,9 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    let docker = Docker::connect_with_local_defaults().context("Failed to connect to Docker")?;
+    let docker = Docker::connect_with_local_defaults()
+        .context("Failed to connect to Docker")?
+        .with_timeout(Duration::from_secs(600));
 
     let builder = services::S3::default()
         .bucket(&cli.bucket)
