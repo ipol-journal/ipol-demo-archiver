@@ -43,6 +43,67 @@ struct Cli {
     secret_access_key: String,
 }
 
+#[derive(Debug, Clone)]
+struct ImageSpec {
+    /// starts with ipol-demo- (probably)
+    name: String,
+    /// git commit hash (it might not be a commit hash for non-demos images, that we still want to backup)
+    commit_hash: String,
+    /// docker image image id
+    image_id: String,
+}
+
+impl ImageSpec {
+    fn as_tar_filename(&self) -> String {
+        // if the name contains the registry, replace the '/' by '_'
+        let name = self.name.replace('/', "_");
+
+        let image_hash = self.image_id.strip_prefix("sha256:").unwrap();
+
+        format!("{}_{}_{}.tar", name, self.commit_hash, image_hash)
+    }
+}
+
+impl TryFrom<&bollard::models::ImageSummary> for ImageSpec {
+    type Error = anyhow::Error;
+
+    fn try_from(value: &bollard::models::ImageSummary) -> Result<Self, Self::Error> {
+        let image_id = value.id.clone();
+
+        let image_tag = value
+            .repo_tags
+            .first()
+            .context("image has no tags")?
+            .to_string();
+
+        let (name, commit_hash) = {
+            let mut split = image_tag.split(':');
+
+            let name = split
+                .next()
+                .context("invalid docker image tag, cannot split by `:`.")?
+                .to_string();
+
+            let commit_hash = split
+                .next()
+                .context("invalid docker image tag, cannot split by `:`.")?
+                .to_string();
+
+            anyhow::ensure!(
+                split.next().is_none(),
+                "invalid docker image tag, as more than one `:`."
+            );
+            (name, commit_hash)
+        };
+
+        Ok(Self {
+            name,
+            commit_hash,
+            image_id,
+        })
+    }
+}
+
 struct ImageArchiver {
     docker: Docker,
     storage: opendal::Operator,
@@ -53,21 +114,10 @@ impl ImageArchiver {
         Self { docker, storage }
     }
 
-    async fn upload_image(&self, image: bollard::models::ImageSummary) -> Result<()> {
-        let image_tag = image
-            .repo_tags
-            .first()
-            .context("Image has no tags")?
-            .to_string();
-
-        let path = format!(
-            "{}_{}.tar",
-            image_tag.replace(['/', ':'], "_"),
-            image.id.strip_prefix("sha256:").unwrap()
-        );
+    async fn upload_image(&self, image: bollard::models::ImageSummary, path: &str) -> Result<()> {
         if self
             .storage
-            .exists(&path)
+            .exists(path)
             .await
             .context("Failed to check file existence")?
         {
@@ -75,11 +125,17 @@ impl ImageArchiver {
             return Ok(());
         }
 
-        info!("Exporting docker image {}", image_tag);
-        let mut tar_stream = self.docker.export_image(&image_tag);
+        let image_tag = image
+            .repo_tags
+            .first()
+            .context("Image has no tags")?
+            .to_string();
+
+        info!("Exporting docker image {:?}", image_tag);
+        let mut tar_stream = self.docker.export_image(&image.id);
         let mut writer = self
             .storage
-            .writer_with(&path)
+            .writer_with(path)
             .chunk(128 * 1024 * 1024)
             .concurrent(8)
             .await
@@ -152,35 +208,28 @@ async fn main() -> Result<()> {
         .await
         .context("Failed to list Docker images")?;
 
-    let filtered_images = images
-        .into_iter()
-        .filter(|image| {
-            !image.repo_tags.is_empty() && !image.repo_tags.contains(&"<none>:<none>".to_string())
-        })
-        .filter(|image| {
-            cli.prefix.as_ref().map_or(true, |prefix| {
-                image.repo_tags.iter().any(|tag| tag.starts_with(prefix))
-            })
-        })
-        .filter(|image| {
-            if cli.ignore_workshop_demos {
-                if let Some(tag) = image.repo_tags.first() {
-                    return !tag.starts_with("ipol-demo-77777");
-                }
-            }
-            true
-        })
-        .filter(|image| {
-            if cli.ignore_test_demos {
-                if let Some(tag) = image.repo_tags.first() {
-                    return !tag.starts_with("ipol-demo-55555");
-                }
-            }
-            true
-        });
+    let prefix = cli.prefix.unwrap_or_default();
+    for image in images {
+        let Ok(imagespec) = ImageSpec::try_from(&image) else {
+            info!("skip {} {:?}", image.id, image.repo_tags);
+            continue;
+        };
 
-    for image in filtered_images {
-        if let Err(e) = archiver.upload_image(image).await {
+        if !imagespec.name.starts_with(&prefix) {
+            continue;
+        }
+
+        if cli.ignore_workshop_demos && imagespec.name.starts_with("ipol-demo-77777") {
+            continue;
+        }
+
+        if cli.ignore_test_demos && imagespec.name.starts_with("ipol-demo-55555") {
+            continue;
+        }
+
+        let path = imagespec.as_tar_filename();
+
+        if let Err(e) = archiver.upload_image(image, &path).await {
             error!("Failed to upload image: {:#}", e);
         }
     }
