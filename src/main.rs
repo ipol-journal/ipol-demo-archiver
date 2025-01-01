@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use bollard::secret::ImageSummary;
 use bollard::Docker;
 use clap::Parser;
 use futures_util::stream::StreamExt;
@@ -42,6 +43,9 @@ struct Cli {
     /// S3 secret access key
     #[arg(long, env = "S3_SECRET_ACCESS_KEY")]
     secret_access_key: String,
+
+    #[arg(long)]
+    dry_run: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -122,17 +126,16 @@ impl ImageArchiver {
         Self { docker, storage }
     }
 
-    async fn upload_image(&self, image: bollard::models::ImageSummary, path: &str) -> Result<()> {
-        if self
+    async fn file_exists(&self, path: &str) -> Result<bool> {
+        let exists = self
             .storage
             .exists(path)
             .await
-            .context("Failed to check file existence")?
-        {
-            info!("File {} already exists, skipping", path);
-            return Ok(());
-        }
+            .context("Failed to check file existence")?;
+        Ok(exists)
+    }
 
+    async fn upload_image(&self, image: bollard::models::ImageSummary, path: &str) -> Result<()> {
         let image_tag = image
             .repo_tags
             .first()
@@ -190,7 +193,7 @@ impl ImageArchiver {
         }
     }
 
-    async fn remove_existings(
+    async fn identify_existings(
         &self,
         prefix: &str,
         cutoff_date: OffsetDateTime,
@@ -232,9 +235,27 @@ impl ImageArchiver {
         for key in &to_remove {
             info!("removing {key} because it is older than {cutoff_date}");
         }
-        self.storage.delete_iter(to_remove.clone()).await?;
 
         Ok(to_remove)
+    }
+
+    async fn remove_all(&self, keys: &[String]) -> Result<()> {
+        self.storage.delete_iter(keys.to_vec()).await?;
+        Ok(())
+    }
+}
+
+struct Plan {
+    to_remove: Vec<String>,
+    to_upload: Vec<(ImageSummary, ImageSpec)>,
+}
+
+impl Plan {
+    fn new() -> Self {
+        Self {
+            to_remove: vec![],
+            to_upload: vec![],
+        }
     }
 }
 
@@ -266,11 +287,15 @@ async fn main() -> Result<()> {
         .await
         .context("Failed to list Docker images")?;
 
+    let mut plan = Plan::new();
     let prefix = cli.prefix.unwrap_or_default();
     for image in images {
-        let Ok(imagespec) = ImageSpec::try_from(&image) else {
-            info!("skip {} {:?}", image.id, image.repo_tags);
-            continue;
+        let imagespec = match ImageSpec::try_from(&image) {
+            Ok(i) => i,
+            Err(e) => {
+                info!("skip {}: {:?}", image.id, e);
+                continue;
+            }
         };
 
         if !imagespec.name.starts_with(&prefix) {
@@ -286,12 +311,34 @@ async fn main() -> Result<()> {
         }
 
         let path = imagespec.as_tar_filename();
-
         info!("candidate for upload: {path}");
-        let _existings = archiver.remove_existings(&path, imagespec.created).await?;
+
+        if archiver.file_exists(&path).await? {
+            info!("file {} already exists, skipping", path);
+            continue;
+        }
+
+        let existings = archiver
+            .identify_existings(&path, imagespec.created)
+            .await?;
+        plan.to_remove.extend(existings);
+        plan.to_upload.push((image, imagespec));
+    }
+
+    if !cli.dry_run {
+        archiver.remove_all(&plan.to_remove).await?;
+        for (image, imagespec) in plan.to_upload {
+            let path = imagespec.as_tar_filename();
             if let Err(e) = archiver.upload_image(image, &path).await {
                 error!("Failed to upload image: {:#}", e);
             }
+        }
+    } else {
+        info!("would remove: {:?}", plan.to_remove);
+        info!("would upload:");
+        for (_, imagespec) in plan.to_upload {
+            let path = imagespec.as_tar_filename();
+            info!("- {imagespec:?} to {path}");
         }
     }
 
