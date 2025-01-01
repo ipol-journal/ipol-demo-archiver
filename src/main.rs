@@ -6,6 +6,7 @@ use clap::Parser;
 use futures_util::stream::StreamExt;
 use opendal::services;
 use opendal::Operator;
+use time::OffsetDateTime;
 use tracing::{error, info};
 
 #[derive(Parser)]
@@ -51,12 +52,15 @@ struct ImageSpec {
     commit_hash: String,
     /// docker image image id
     image_id: String,
+    /// creation date of the docker image
+    created: OffsetDateTime,
 }
 
 impl ImageSpec {
     fn as_tar_filename(&self) -> String {
-        // if the name contains the registry, replace the '/' by '_'
-        let name = self.name.replace('/', "_");
+        // if the name contains the registry, or any '_', replace by '-' so that the filename can
+        // later be split in its three parts
+        let name = self.name.replace(['/', '_'], "-");
 
         let image_hash = self.image_id.strip_prefix("sha256:").unwrap();
 
@@ -96,10 +100,14 @@ impl TryFrom<&bollard::models::ImageSummary> for ImageSpec {
             (name, commit_hash)
         };
 
+        let created = value.created;
+        let created = OffsetDateTime::from_unix_timestamp(created)?;
+
         Ok(Self {
             name,
             commit_hash,
             image_id,
+            created,
         })
     }
 }
@@ -131,11 +139,14 @@ impl ImageArchiver {
             .context("Image has no tags")?
             .to_string();
 
+        let metadata = vec![("created".to_string(), image.created.to_string())];
+
         info!("Exporting docker image {:?}", image_tag);
         let mut tar_stream = self.docker.export_image(&image.id);
         let mut writer = self
             .storage
             .writer_with(path)
+            .user_metadata(metadata)
             .chunk(128 * 1024 * 1024)
             .concurrent(8)
             .await
@@ -177,6 +188,53 @@ impl ImageArchiver {
                 Err(e)
             }
         }
+    }
+
+    async fn remove_existings(
+        &self,
+        prefix: &str,
+        cutoff_date: OffsetDateTime,
+    ) -> Result<Vec<String>> {
+        let mut to_remove = vec![];
+        let entries = self.storage.list(prefix).await?;
+        for entry in entries {
+            let key = entry.path();
+            let date_put = entry
+                .metadata()
+                .last_modified()
+                .context("no `last_modified` metadata?")?;
+            let date_put: i64 = date_put.to_utc().timestamp();
+            let date_put = OffsetDateTime::from_unix_timestamp(date_put)?;
+
+            // If the upload is newer than the creation of the image,
+            // it might be two cases:
+            //   - an old image recently uploaded (which we want to replace)
+            //   - an new image recently uploaded (which we don't want to replace)
+            // But if the upload is older, then we definitely want to replace it
+            if date_put >= cutoff_date {
+                let metadata = self.storage.stat(key).await?;
+                let user_metadata = metadata.user_metadata().context("no user_metadata")?;
+                let actual_created = user_metadata
+                    .get("created")
+                    .context("no `created` field in user_metadata")?;
+                let actual_created: i64 = actual_created.parse()?;
+                let actual_created = OffsetDateTime::from_unix_timestamp(actual_created)?;
+
+                if actual_created >= cutoff_date {
+                    info!("skip {key} because it is newer (according to user metadata)");
+                    continue;
+                }
+            }
+
+            to_remove.push(key.to_string());
+        }
+
+        for key in &to_remove {
+            info!("removing {key} because it is older than {cutoff_date}");
+        }
+        self.storage.delete_iter(to_remove.clone()).await?;
+
+        Ok(to_remove)
     }
 }
 
@@ -229,8 +287,11 @@ async fn main() -> Result<()> {
 
         let path = imagespec.as_tar_filename();
 
-        if let Err(e) = archiver.upload_image(image, &path).await {
-            error!("Failed to upload image: {:#}", e);
+        info!("candidate for upload: {path}");
+        let _existings = archiver.remove_existings(&path, imagespec.created).await?;
+            if let Err(e) = archiver.upload_image(image, &path).await {
+                error!("Failed to upload image: {:#}", e);
+            }
         }
     }
 

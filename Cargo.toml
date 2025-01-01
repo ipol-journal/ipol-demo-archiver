@@ -5,13 +5,14 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0.94"
-bollard = "0.18.1"
+bollard = { version = "0.18.1", features = ["time"] }
 clap = { version = "4.5.23", features = ["derive", "env"] }
 futures = "0.3.31"
 futures-util = "0.3.31"
 indicatif = { version = "0.17.9", features = ["improved_unicode"] }
-opendal = { version = "0.50.2", features = ["services-s3"] }
+opendal = { version = "0.51.0", features = ["services-s3"] }
 tar = "0.4.43"
+time = "0.3.37"
 tokio = { version = "1.42.0", features = ["full"] }
 tracing = { version = "0.1.41", features = ["log"] }
 tracing-subscriber = "0.3.19"
